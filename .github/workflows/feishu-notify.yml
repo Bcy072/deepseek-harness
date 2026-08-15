@@ -1,0 +1,194 @@
+# Send a Feishu bot notification when any relevant workflow completes.
+#
+# Triggers after every listed workflow via the workflow_run event, which
+# runs in the default-branch context and needs no modification of the
+# triggering workflow.  Notifications are sent for all failures/cancellations
+# and for successes only on master pushes (PR successes stay quiet).
+#
+# Secrets and variables (repo Settings ->Actions):
+#   vars.DSH_FEISHU_APP_ID      Feishu self-built app App ID (e.g. cli_xxx)
+#   secrets.DSH_FEISHU_APP_SECRET  Feishu self-built app App Secret
+#   vars.DSH_FEISHU_OPEN_ID     Target user open_id (ou_xxx)
+#
+# The bot identity is used (tenant_access_token), which does not expire
+# like user-issued OAuth tokens and works in CI without interactive login.
+
+name: Feishu notify
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - E2E (real DeepSeek API)
+      - E2E (pi-ai Azure OpenAI and Anthropic)
+      - E2E (E2B sandbox)
+      - Release (dsh)
+      - Release (vendor)
+      - Release (Python)
+      - Landlock Run
+      - Landlock Run Release
+      - Deploy documentation
+      - Issue lifecycle
+      - Issue policy
+      - Expected filenames
+      - Build single-exe
+      - Sandbox
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      conclusion:
+        description: Simulated conclusion for manual test
+        required: true
+        default: success
+        type: choice
+        options:
+          - success
+          - failure
+          - cancelled
+      workflow-name:
+        description: Simulated workflow name
+        required: true
+        default: Manual test
+      html-url:
+        description: Simulated run URL (optional)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feishu-notify-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Send Feishu notification
+    runs-on: ubuntu-latest
+    # Notifies on every failure/cancellation and on master-push successes.
+    # A successful PR run produces no message (reduce noise).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure' ||
+      github.event.workflow_run.conclusion == 'cancelled' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'master' &&
+        github.event.workflow_run.event == 'push')
+    steps:
+      - name: Resolve run context
+        id: ctx
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.workflow-name }}" >> "$GITHUB_OUTPUT"
+            echo "conclusion=${{ inputs.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "branch=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "event=workflow_dispatch" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.event.workflow_run.name }}" >> "$GITHUB_OUTPUT"
+            echo "conclusion=${{ github.event.workflow_run.conclusion }}" >> "$GITHUB_OUTPUT"
+            echo "url=${{ github.event.workflow_run.html_url }}" >> "$GITHUB_OUTPUT"
+            echo "branch=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+            echo "event=${{ github.event.workflow_run.event }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Feishu notification
+        env:
+          FEISHU_APP_ID: ${{ vars.DSH_FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.DSH_FEISHU_APP_SECRET }}
+          FEISHU_OPEN_ID: ${{ vars.DSH_FEISHU_OPEN_ID }}
+          WORKFLOW_NAME: ${{ steps.ctx.outputs.name }}
+          CONCLUSION: ${{ steps.ctx.outputs.conclusion }}
+          RUN_URL: ${{ steps.ctx.outputs.url }}
+          BRANCH: ${{ steps.ctx.outputs.branch }}
+          EVENT: ${{ steps.ctx.outputs.event }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+
+          case "$CONCLUSION" in
+            success)   EMOJI="✅"; COLOR="green"  ;;
+            failure)   EMOJI="❌"; COLOR="red"    ;;
+            cancelled) EMOJI="⚪"; COLOR="grey"   ;;
+            *)         EMOJI="⚠️"; COLOR="orange" ;;
+          esac
+
+          # 1. Obtain tenant_access_token with app credentials.
+          TOKEN_RESP=$(curl -sf -X POST \
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+            -H 'Content-Type: application/json' \
+            -d "{\"app_id\":\"$FEISHU_APP_ID\",\"app_secret\":\"$FEISHU_APP_SECRET\"}")
+
+          TOKEN=$(jq -r '.tenant_access_token // empty' <<< "$TOKEN_RESP")
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Failed to obtain Feishu tenant_access_token"
+            echo "$TOKEN_RESP"
+            exit 1
+          fi
+
+          # 2. Build an interactive card payload.
+          SHORT_SHA=$(cut -c1-7 <<< "$HEAD_SHA")
+
+          CARD=$(jq -n \
+            --arg title "$EMOJI $WORKFLOW_NAME" \
+            --arg color "$COLOR" \
+            --arg repo "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg event "$EVENT" \
+            --arg conclusion "$CONCLUSION" \
+            --arg sha "$SHORT_SHA" \
+            --arg run_url "$RUN_URL" \
+            --arg commit_url "https://github.com/$REPO/commit/$HEAD_SHA" \
+            '{
+              config: { wide_screen_mode: true },
+              header: {
+                title: { tag: "plain_text", content: $title },
+                template: $color
+              },
+              elements: [
+                {
+                  tag: "div",
+                  text: {
+                    tag: "lark_md",
+                    content: "**Repo:** \($repo)\n**Branch:** \($branch)\n**Event:** \($event)\n**Commit:** [\($sha)](\($commit_url))\n**Conclusion:** \($conclusion)"
+                  }
+                },
+                { tag: "hr" },
+                {
+                  tag: "action",
+                  actions: [
+                    {
+                      tag: "button",
+                      text: { tag: "plain_text", content: "View run" },
+                      url: $run_url,
+                      type: "primary"
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          # 3. Send as bot to the user's open_id.
+          PAYLOAD=$(jq -n \
+            --arg open_id "$FEISHU_OPEN_ID" \
+            --arg card "$CARD" \
+            '{ receive_id: $open_id, msg_type: "interactive", content: $card }')
+
+          SEND_RESP=$(curl -sf -X POST \
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")
+
+          CODE=$(jq -r '.code // -1' <<< "$SEND_RESP")
+          if [ "$CODE" != "0" ]; then
+            echo "::error::Feishu message API error (code $CODE)"
+            echo "$SEND_RESP"
+            exit 1
+          fi
+
+          MSG_ID=$(jq -r '.data.message_id // "unknown"' <<< "$SEND_RESP")
+          echo "Feishu notification sent: $MSG_ID"
